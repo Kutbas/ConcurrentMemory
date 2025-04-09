@@ -130,7 +130,7 @@ public:
 	// [1,128]					8byte对齐		freelist[0,16)
 	// [128+1,1024]				16byte对齐		freelist[16,72)
 	// [1024+1,8*1024]			128byte对齐		freelist[72,128)
-	// [8*1024+1,64*1024]		1024byte对齐		freelist[128,184)
+	// [8*1024+1,64*1024]		1024byte对齐	freelist[128,184)
 	// [64*1024+1,256*1024]		8*1024byte对齐	freelist[184,208)
 
 	static inline size_t _RoundUp(size_t bytes, size_t align)

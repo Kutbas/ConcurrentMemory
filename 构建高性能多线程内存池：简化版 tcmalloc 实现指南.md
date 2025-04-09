@@ -166,6 +166,10 @@ static void *&NextObj(void *obj)
 
 这样设计下来，最多只需要 **208个桶**，空间浪费也被控制在10%左右。浪费最多的点通常是每个区间的起始，比如 1B、129B、1025B，这些对齐后会有一定冗余，但相对于分配效率，这点浪费可以接受。
 
+基于这样的设计，`ThreadCache` 的逻辑结构就如下图所示：
+
+![](https://raw.githubusercontent.com/Kutbas/GraphBed/main/Typora/202504092131919.png)
+
 ### 04.3 SizeClass：对齐与桶映射工具类
 
 为了计算每次申请要对齐到多少字节、落在哪个桶里，我们专门写一个 `SizeClass` 类，内部的方法如下所示：
@@ -281,15 +285,136 @@ void* ThreadCache::Allocate(size_t size)
 
 ### 05.1 ThreadCache 与 CentralCache 的关系
 
+我们先来看下 `CentralCache` 的结构：
+
+```c++
+// 单例模式
+class CentralCache
+{
+    public:
+    static CentralCache* GetInstance()
+    {
+        return &_sInst;
+    }
+
+    // 获取⼀个非空的 span
+    Span* GetOneSpan(SpanList& list, size_t size);
+
+    // 从central cache获取一定数量的内存对象给thread cache
+    
+    size_t FetchRangeObj(void*& start, void*& end, size_t batchNum, size_t size);
+    // 将⼀定数量的对象释放到 Span
+    void ReleaseListToSpans(void* start, size_t size);
+    
+    private:
+    SpanList _spanLists[NFREELIST];
+    private:
+    CentralCache(){}
+    CentralCache(const CentralCache&) = delete;
+
+    static CentralCache _sInst;
+};
+```
+
 实际上，`ThreadCache`  和 `CentralCache` 有很多相似之处，比较明显的是 `CentralCache` 也采用了哈希结构来存储数据，并且同样是根据块的大小来进行映射。两者的映射规则一致带来了许多便利，比如当 `ThreadCache` 对应的哈希桶没有足够的空间时，可以直接向 `CentralCache` 的相同哈希桶请求空间。这样一来，两个系统中的哈希桶实现一一对应，查找操作也变得更加高效。
 
+`ThreadCache` 和 `CentralCache` 最大的区别在于线程隔离和锁的使用。
 
+由于每个线程都有自己的 `ThreadCache`，所以线程向自己的 `ThreadCache` 申请空间时，是**不需要加锁**的，效率很高。但如果某个桶（比如 24B）已经空了，`ThreadCache` 就会从全局的 `CentralCache` 中申请内存。这个时候问题来了：**`CentralCache` 是全局唯一的，并且所有线程共享一个桶（SpanList）**。
 
-### 05.2 内存分配的线程安全
+举个例子，如果线程 `t1` 和 `t2` 同时从各自 `ThreadCache` 的 24B 桶申请内存，而这个桶恰好都空了，它们就会同时向 `CentralCache` 的 2 号桶发起请求。此时就会发生竞争，因此必须加锁来确保线程安全。
 
-`ThreadCache`  和 `CentralCache` 之间的区别在于，线程可以自由地向 `ThreadCache` 申请空间，无需加锁，因为每个线程都拥有自己独立的 `ThreadCache`。而当多个 `ThreadCache` 的同一位置的哈希桶空间不足时，它们会并发地向 `CentralCache` 申请空间，此时 `CentralCache` 只有一个实例，这就需要加锁。举个例子，如果线程 `t1` 和 `t2` 分别向各自的 `ThreadCache` 2号桶（24B）申请空间，并且这两个桶都为空，那么它们就会同时向 `CentralCache` 的2号桶请求空间。在这种情况下，由于多个线程竞争同一资源，我们需要加锁，以确保不会发生并发冲突。
+值得注意的是：**不是每次访问 CentralCache 都会锁冲突**，只有当多个线程竞争同一个桶时才会锁冲突。如果 `t1` 向 24B 的桶申请，`t2` 向 128B 的桶申请，它们访问的是 `CentralCache` 中的不同桶，使用的是不同的锁，不会产生冲突。
 
-### 05.3 Span 结构与内存管理
+### 05.2 Span 结构与内存管理
+
+除了锁机制的不同，`ThreadCache`  和 `CentralCache` 在管理内存方面也有所不同。在 `ThreadCache` 中，自由链表挂的是一个个小块空间，而在 `CentralCache` 中，自由链表挂的是 `Span` 结构体，这是一种管理大块内存的结构体，它以**页**为单位进行管理，每个 `Span` 可以包含多个页。其逻辑结构如下图所示：
+
+![](https://raw.githubusercontent.com/Kutbas/GraphBed/main/Typora/202504092152144.png)
+
+`Span` 结构体的实现如下所示：
+
+```c++
+// 管理多个连续页的大块内存跨度结构
+struct Span
+{
+    PAGE_ID _pageId = 0;		// 大块内存的起始页号
+    size_t _n = 0;				// 页的数量
+    // 双向链表
+    Span* _next = nullptr;
+    Span* _prev = nullptr;
+
+    size_t _objSize = 0;		// 切好的小对象的大小
+    size_t _useCount = 0;		// 切好的小块内存被分配给thread cache的数量
+    void* _freeList = nullptr;	// 切好的小块内存的自由链表
+
+    bool _isUse = false;		// 是否被使用
+};
+```
+
+在 `Span` 结构体中，有一个 `_n` 成员变量，用来记录该 `Span` 管理了多少页（Page）内存。而具体需要多少页，是由 `SizeClass::NumMovePage(size)` 决定的，它会根据你当前要分配的小块内存 `size` 动态计算出合理的页数。其实现方式如下所示：
+
+```c++
+class SizeClass
+{
+    public:
+    // 一次从中心缓存获取多少个
+    static size_t NumMoveSize(size_t size)
+    {
+        assert(size > 0);
+        if (size == 0)
+            return 0;
+        // [2, 512]，⼀次批量移动多少个对象的(慢启动)上限值
+        // 小对象一次批量上限⾼
+        // 小对象一次批量上限低
+        int num = MAX_BYTES / size;
+        if (num < 2)
+            num = 2;
+        if (num > 512)
+            num = 512;
+        return num;
+    }
+
+    // 计算一次向系统获取几个页
+    // 单个对象 8B
+    // ...
+    // 单个对象 256KB
+    static size_t NumMovePage(size_t size)
+    {
+        size_t num = NumMoveSize(size);
+        size_t npage = num * size;
+        npage >>= PAGE_SHIFT;
+        if (npage == 0)
+            npage = 1;
+        return npage;
+    }
+
+};
+```
+
+整个计算过程是这样的：
+
+1. **先算出要搬多少个对象**：
+    使用 `NumMoveSize(size)`，根据对象的大小，系统估计出一次批量搬运多少个比较合适。这个值是 `MAX_BYTES / size`，也就是说小对象（size小）就多搬点，大对象就少搬点，并且限定在 [2, 512] 之间。
+2. **算出总共需要多少字节**：
+    比如要搬 `num` 个对象，每个对象 `size` 字节，总共 `num * size` 字节。
+3. **换算成页数**：
+    把总字节数除以页大小（`PAGE_SHIFT` 是页大小的对数，通常是 8KB），最终得到 `npage`。如果结果是 0（比如很小的对象），也会被强制设置成至少 1 页，保证不会返回空 `Span`。
+
+下面我们举两个例子：
+
+- **对象大小为 8 字节**：
+  - `NumMoveSize(8) = 256`，因为 `1024 / 8 = 128`，在 [2, 512] 范围内；
+  - 总字节数：256 × 8 = 2048 字节；
+  - 页数：2048 / 8192 = 0.25 → 向下取整为 0，但最终返回 1 页。
+- **对象大小为 128KB**：
+  - `NumMoveSize(131072) = 2`，因为 `1024 / 131072 < 2`，被强制取 2；
+  - 总字节数：2 × 131072 = 256KB；
+  - 页数：256KB / 8KB = 32 → 返回 32 页。
+
+由此可以看出：`Span` 并不是固定管理某个桶号对应的页数，而是动态地根据实际要搬运的小块大小去合理分配页数。这个机制既保证了空间利用率，也避免了内存碎片问题。
+
+### 05.3 使用 SpanList 管理 Span
 
 ### 05.4 内存分配与回收机制
 
