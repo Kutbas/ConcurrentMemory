@@ -6,6 +6,8 @@
 
 本项目将涉及到C/C++、数据结构（如链表、哈希桶）、操作系统内存管理、单例模式、多线程、互斥锁等技术。如果你对这些概念还不熟悉，建议先学习这些相关知识，确保理解这些基础知识后再深入本篇内容。
 
+项目源代码地址：https://github.com/Kutbas/ConcurrentMemory
+
 ## 01 内存池技术概览
 
 池化技术是一种资源管理策略，它的基本思想是程序预先申请超出当前需求的资源，然后自主管理这些资源，以备未来使用。
@@ -49,16 +51,143 @@
 
 在学习高并发内存池之前，我们先来热个身，手动实现一个**定长内存池**，帮助大家建立对“内存池”的基本认识。
 
-我们知道 `malloc` 虽然万能，但为了应对各种情况，设计得相对复杂，在高频率、小对象申请释放的场景下，效率可能不理想。而在一些场景中，我们只需要申请和释放**固定大小**的内存块，这时就可以考虑定长内存池这种更高效、更轻量的解决方案。
+我们知道 `malloc` 虽然万能，但为了应对各种情况，设计得相对复杂，在高频率、小对象申请释放的场景下，效率可能不理想。那么，如果某个场景中我们只需要固定大小的内存分配，还有必要使用复杂的通用方案吗？其实完全可以设计一个更**简洁高效**的内存池，专门处理这种定长需求，这也正是我们现在要做的。
 
-这个定长内存池的原理其实不复杂：
+这个定长内存池的实现非常轻量，不到 100 行代码就能搞定，具体实现可以总结为以下几点：
 
 - 预先申请一大块内存，把它切成一小块一小块的用；
 - 用**自由链表**把这些小块管理起来，实现空间的重复利用；
 - 如果用完了，再申请一块新的接着用；
 - 每次回收时，就把小块重新挂到自由链表上。
 
-话不多说。
+话不多说，代码奉上：
+
+```c++
+template<class T>
+class ObjectPool
+{
+	public:
+	T* New()
+	{
+		T* obj = nullptr;
+		// 优先使用还回来的内存
+		if (_freeList)
+		{
+			void* next = *((void**)_freeList);
+			obj = (T*)_freeList;
+			_freeList = next;
+			
+		}
+		else
+		{
+			// 如果剩余内存不够一个对象大小时，则重新开大块空间
+			if (_remainBytes < sizeof(T))
+			{
+				_remainBytes = 128 * 1024;
+				//_memory = (char*)malloc(_remainBytes);
+				_memory = (char*)SystemAlloc(_remainBytes >> 13);
+				if (_memory == nullptr)
+					throw std::bad_alloc();
+			}
+
+			obj = (T*)_memory;
+			size_t objSize = sizeof(T) < sizeof(void*) ? sizeof(void*) : sizeof(T);
+			_memory += objSize;
+			_remainBytes -= objSize;
+
+		}
+		
+		// 定位new，显示调用T的构造函数初始化
+		new(obj)T;
+		return obj;
+	}
+
+	void Delete(T* obj)
+	{
+		// 显示调用析构函数清理对象
+		obj->~T();
+
+		// 头插，为空与否的插入方式一致
+		*(void**)obj = _freeList;
+		_freeList = obj;
+		
+	}
+	private:
+	char* _memory = nullptr; // 指向大块内存的指针
+	size_t _remainBytes = 0; // 大块内存在切分过程中剩余的字节数
+	void* _freeList = nullptr; // 还回来过程中链接的自由链表
+
+};
+```
+
+这样，一个简单而高效的定长内存池就实现了。下面我们写段代码来测试一下：
+
+```c++
+struct TreeNode
+{
+    int _val;
+    TreeNode* _left;
+    TreeNode* _right;
+    TreeNode()
+        :_val(0)
+            , _left(nullptr)
+            , _right(nullptr)
+        {}
+};
+
+void TestObjectPool()
+{
+    const size_t Rounds = 3;// 申请释放的轮次
+    const size_t N = 1000000;// 每轮申请释放多少次
+
+    size_t begin1 = clock();
+    std::vector<TreeNode*> v1;
+    v1.reserve(N);
+
+    for (size_t j = 0; j < Rounds; ++j)
+    {
+        for (int i = 0; i < N; ++i)
+        {
+            v1.push_back(new TreeNode);
+        }
+        for (int i = 0; i < N; ++i)
+        {
+            delete v1[i];
+        }
+        v1.clear();
+    }
+
+    size_t end1 = clock();
+
+
+    ObjectPool<TreeNode> TNPool;
+    size_t begin2 = clock();
+    std::vector<TreeNode*> v2;
+    v2.reserve(N);
+
+    for (size_t j = 0; j < Rounds; ++j)
+    {
+        for (int i = 0; i < N; ++i)
+        {
+            v2.push_back(TNPool.New());
+        }
+        for (int i = 0; i < 100000; ++i)
+        {
+            TNPool.Delete(v2[i]);
+        }
+        v2.clear();
+    }
+    size_t end2 = clock();
+    cout << "new cost time:" << end1 - begin1 << endl;
+    cout << "object pool cost time:" << end2 - begin2 << endl;
+}
+```
+
+可以看到，在多轮申请和释放下，使用定长内存池的速度明显优于 `new/delete` 机制。
+
+![](https://raw.githubusercontent.com/Kutbas/GraphBed/main/Typora/202504101807793.png)
+
+到这里，一个简单的定长内存池就算搞定了，下面我们正式进入高并发内存池的实现。
 
 ## 04 Thread Cache 初步实现
 
@@ -416,7 +545,87 @@ class SizeClass
 
 ### 05.3 使用 SpanList 管理 Span
 
-### 05.4 内存分配与回收机制
+在了解了 `Span` 是如何按页单位管理大块内存之后，我们还需要搞清楚一个问题：这些 `Span` 是如何在 `CentralCache` 中被组织起来的？答案是通过 `SpanList`。我们可以把它理解成一个管理不同大小 `Span` 的仓库，负责挂载所有当前空闲的、已经被切好块的 `Span`。
+
+`SpanList` 的实现本质上是一个**双向循环链表**，每一个桶号都有对应的一条链表来维护这些 `Span`，例如 24B 对象的第 2 号桶，就会拥有一条专门维护 24B 对象的 `SpanList`，里面挂着一个个页数不同、但都被切成 24B 小块的 `Span`。这使得 `CentralCache` 的内部结构非常清晰：每种对象大小一个桶，每个桶一个链表，链表里挂的是装满了该类型对象的 `Span`。
+
+此外，为了解决前面我们提到的线程安全问题，`SpanList` 在内部维护了一把互斥锁 `std::mutex _mtx`。我们已经知道，它是**桶级别的锁**，每个桶只保护自己的 `SpanList`，而不影响其他桶。
+
+了解了 `SpanList` 的这些特性，下面我们来看下它的实现：
+
+```c++
+class SpanList
+{
+public:
+	SpanList()
+	{
+		_head = new Span;
+		_head->_next = _head;
+		_head->_prev = _head;
+	}
+
+	Span *Begin();
+	Span *End();
+	bool Empty();
+	void PushFront(Span *span);
+	Span *PopFront();
+	void Insert(Span *pos, Span *newSpan);
+	void Erase(Span *pos);
+
+public:
+	std::mutex _mtx; // 桶锁
+private:
+	Span *_head;
+};
+```
+
+### 05.4 FetchFromCentralCache 的实现
+
+接下来我们来梳理一下 `ThreadCache` 和 `CentralCache` 之间的交互逻辑，也就是 `FetchFromCentralCache` 函数的实现。
+
+首先我们要明确这个函数的作用是：当线程从 `ThreadCache` 申请内存时，如果对应的自由链表里已经没有空闲块了，就需要向 `CentralCache` 请求更多的内存。`CentralCache` 会从对应哈希桶下挂的 `Span` 中取出若干块内存，交还给 `ThreadCache` 使用。
+
+那这里有一个关键问题：每次要从 `CentralCache` 拿多少块比较合适？拿太少效率低，拿太多又容易浪费。
+
+为了解决这个问题，我们引入了一种“慢启动 + 增量反馈”的策略 —— 和网络里的拥塞控制有点类似。刚开始的时候，`CentralCache` 只给 `ThreadCache` 一小块内存，如果发现 `ThreadCache` 对这个大小的内存频繁请求，就逐步增加它每次拿的数量。比如第一次只给 1 块，第二次给 2 块，第三次给 3 块…… 以此类推。这个过程有上限，不能无限增加，以防内存浪费。
+
+这个动态控制的核心在于：`ThreadCache` 里的每个 `FreeList` 都记录了一个 `MaxSize` 值，表示当前最多能申请多少块。 `CentralCache` 每次分配时，会取 `MaxSize` 和 `SizeClass::NumMoveSize(alignSize)` 中较小的值来作为本次的分配数量。如果这次的分配量正好等于 `MaxSize`，那说明当前请求频率比较高，就将 `MaxSize` 加 1，为下一次留出更大的配额。这样就实现了逐步放宽的反馈机制。之后，`CentralCache` 会调用另一个函数 `FetchRangeObj`，从对应的 `Span` 中取出一整段连续的内存块。这个函数返回实际取出的块数（可能比请求的少），并通过 `start` 和 `end` 两个输出指针返回这段内存的起止位置。
+
+拿到这段空间后，如果只获得了 1 块，就直接返回给线程；如果获得了多块，就把前一块返回给线程，把剩下的 `[ObjNext(start), end]` 插入到当前线程的自由链表中，供后续分配使用。
+
+整个流程清晰又高效，既能动态适应线程的内存请求，又尽量避免资源浪费，是一个很优雅的设计。
+
+下面是 `FetchFromCentralCache` 函数的具体实现：
+
+```c++
+void *ThreadCache::FetchFromCentralCache(size_t index, size_t size)
+{
+    size_t batchNum = min(_freeLists[index].MaxSize(), SizeClass::NumMoveSize(size));
+
+    if (_freeLists[index].MaxSize() == batchNum)
+    {
+        _freeLists[index].MaxSize() += 1;
+    }
+
+    void *start = nullptr;
+    void *end = nullptr;
+    size_t actualNum = CentralCache::GetInstance()->FetchRangeObj(start, end, batchNum, size);
+    assert(actualNum > 0);
+
+    if (actualNum == 1)
+    {
+        assert(start == end);
+        return start;
+    }
+    else
+    {
+        _freeLists[index].PushRange(NextObj(start), end, actualNum - 1);
+        return start;
+    }
+}
+```
+
+到目前为止，我们实际上只实现了空间的“申请”逻辑，释放还没涉及，比如 `ThreadCache` 如何将不用的块还给 `CentralCache`，以及 `CentralCache` 如何将空闲 `Span` 归还给 `PageCache`。为了让流程更容易理解，我们打算先把分配的部分理顺，后续再补上回收机制。
 
 ## 06 Page Cache 实现
 
