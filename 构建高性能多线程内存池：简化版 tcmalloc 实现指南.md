@@ -1,6 +1,6 @@
 # 构建高性能多线程内存池：简化版 tcmalloc 实现指南
 
-## 引言
+## 00 引言
 
 在高并发应用中，频繁的小块内存申请与释放不仅会带来性能瓶颈，还容易导致内存碎片问题。为此，内存池技术应运而生，而 `tcmalloc`（Thread-Caching Malloc）作为 Google 开源的高性能内存分配器，是学习与借鉴的优秀模板。本文将以简化版 `tcmalloc` 为目标，从零手把手带你构建一个支持多线程的高性能内存池。
 
@@ -412,7 +412,7 @@ void* ThreadCache::Allocate(size_t size)
 
 现在我们知道，当 `ThreadCache` 的空间不足时，会向 `CentralCache` 请求更多的空间。在`ThreadCache`的实现中，曾留有一个接口 `FetchFromCentralCache`，这个接口的具体实现会在我们讨论完`CentralCache`的细节后完成。
 
-### 05.1 ThreadCache 与 CentralCache 的关系
+### 05.1 Thread Cache 与 Central Cache 的关系
 
 我们先来看下 `CentralCache` 的结构：
 
@@ -524,7 +524,7 @@ class SizeClass
 整个计算过程是这样的：
 
 1. **先算出要搬多少个对象**：
-    使用 `NumMoveSize(size)`，根据对象的大小，系统估计出一次批量搬运多少个比较合适。这个值是 `MAX_BYTES / size`，也就是说小对象（size小）就多搬点，大对象就少搬点，并且限定在 [2, 512] 之间。
+    使用 `NumMoveSize(size)`，根据对象的大小，系统估计出一次批量搬运多少个比较合适。这个值是 `MAX_BYTES / size`，也就是说小对象就多搬点，大对象就少搬点，并且限定在 [2, 512] 之间。
 2. **算出总共需要多少字节**：
     比如要搬 `num` 个对象，每个对象 `size` 字节，总共 `num * size` 字节。
 3. **换算成页数**：
@@ -587,7 +587,7 @@ private:
 
 那这里有一个关键问题：每次要从 `CentralCache` 拿多少块比较合适？拿太少效率低，拿太多又容易浪费。
 
-为了解决这个问题，我们引入了一种“慢启动 + 增量反馈”的策略 —— 和网络里的拥塞控制有点类似。刚开始的时候，`CentralCache` 只给 `ThreadCache` 一小块内存，如果发现 `ThreadCache` 对这个大小的内存频繁请求，就逐步增加它每次拿的数量。比如第一次只给 1 块，第二次给 2 块，第三次给 3 块…… 以此类推。这个过程有上限，不能无限增加，以防内存浪费。
+为了解决这个问题，我们引入了一种“**慢启动 + 增量反馈**”的策略，这和网络里的拥塞控制有点类似。刚开始的时候，`CentralCache` 只给 `ThreadCache` 一小块内存，如果发现 `ThreadCache` 对这个大小的内存频繁请求，就逐步增加它每次拿的数量。比如第一次只给 1 块，第二次给 2 块，第三次给 3 块…… 以此类推。这个过程有上限，不能无限增加，以防内存浪费。
 
 这个动态控制的核心在于：`ThreadCache` 里的每个 `FreeList` 都记录了一个 `MaxSize` 值，表示当前最多能申请多少块。 `CentralCache` 每次分配时，会取 `MaxSize` 和 `SizeClass::NumMoveSize(alignSize)` 中较小的值来作为本次的分配数量。如果这次的分配量正好等于 `MaxSize`，那说明当前请求频率比较高，就将 `MaxSize` 加 1，为下一次留出更大的配额。这样就实现了逐步放宽的反馈机制。之后，`CentralCache` 会调用另一个函数 `FetchRangeObj`，从对应的 `Span` 中取出一整段连续的内存块。这个函数返回实际取出的块数（可能比请求的少），并通过 `start` 和 `end` 两个输出指针返回这段内存的起止位置。
 
@@ -628,4 +628,256 @@ void *ThreadCache::FetchFromCentralCache(size_t index, size_t size)
 到目前为止，我们实际上只实现了空间的“申请”逻辑，释放还没涉及，比如 `ThreadCache` 如何将不用的块还给 `CentralCache`，以及 `CentralCache` 如何将空闲 `Span` 归还给 `PageCache`。为了让流程更容易理解，我们打算先把分配的部分理顺，后续再补上回收机制。
 
 ## 06 Page Cache 实现
+
+`PageCache` 在整体架构上和 `CentralCache` 类似，核心都是通过哈希桶来管理 `Span`。区别在于，在 `CentralCache` 中，哈希映射规则和 `ThreadCache` 一样，都是通过 `size` 来定位桶，而 `PageCache` 则是按照 `Span` 的页数来组织的：第 `i` 号桶中挂的全是管理 `i` 页的 `Span`。
+
+此外，由于 `PageCache` 的 `Span` 是按页数分桶的，所以其哈希结构更直接，不涉及对内部空间的再划分。也就是说，从 `PageCache` 拿到的 `Span` 是一整块的连续内存，具体的划分操作交由 `CentralCache` 去处理。
+
+`PageCache`  中 `Span` 的最大管理页数是 128 页。如果一页是 8KB，那么 128 页就是 1MB 的空间，已经能满足最大 256KB 块的需求。当然也可以扩展更大的 span 管理能力，但当前实现以 128 页为界限。
+
+简单介绍完 `PageCache`  和 `CentralCache` 的差异后，下面我们来看看 `PageCache` 的结构。
+
+### 06.1 Page Cache 的基本结构
+
+和 `CentralCache` 一样，`PageCache`  的核心是一个数组，数组的每个元素都是一个 `SpanList`，总数为 129 个（多预留一个，方便从 1 号桶开始直接映射）。这个数组中的第 n 项就负责 n 页大小的 `Span`。
+
+另一点和 `CentralCache` 一样的是，`PageCache` 也需要加锁。但 `CentralCache`  是按桶加锁，而 `PageCache` 是整体加锁。这是因为 `Span` 的分裂和合并可能会影响多个桶之间的状态，只有整体加锁才能保证一致性。由于多个线程可能同时通过 `CentralCache`  向 `PageCache` 申请 `Span`，所以这个全局锁是必须的。
+
+`PageCache`  作为全局唯一组件，也被实现成了饿汉式单例，静态实例定义放在 `.cpp` 文件中，避免链接冲突。
+
+```c++
+class PageCache
+{
+    public:
+    static PageCache* GetInstance()
+    {
+        return &_sInst;
+    }
+
+    // 获取从对象到 Span 的映射
+    Span* MapObjectToSpan(void* obj);
+
+    // 获取一个 k 页的 Span
+    Span* NewSpan(size_t k);
+    
+    // 将空闲 Span归还至 page cache，并合并相邻 Span
+    void ReleaseSpanToPageCache(Span* span);
+    
+    public:
+    std::mutex _pageMtx;
+    private:
+    SpanList _spanLists[NPAGES]; 
+    // NPAGES = 129，多开的那一个桶（第 0 号）是为了映射逻辑更自然，省去了 -1 的偏移操作。
+    ObjectPool<Span> _spanPool;
+    
+    TCMalloc_PageMap1<32 - PAGE_SHIFT> _idSpanMap;
+
+    static PageCache _sInst;
+
+    PageCache(){}
+    PageCache(const PageCache&) = delete;
+};
+```
+
+### 06.2 Span 的分裂与合并机制
+
+无论是在 `ThreadCache`、`CentralCache` 还是 `PageCache` 中，内存的申请与释放流程始终是核心。`PageCache` 中的分裂与合并机制，正是为了灵活调配这些 `Span`。
+
+**分裂逻辑：**
+ 当 `CentralCache`  通过 `NewSpan()` 向 `PageCache` 请求一个管理 k 页的 `Span` 时，`PageCache` 会先看对应桶（第 k 号）是否有 `Span`。如果没有，就从更大页数的桶中找，看是否能找到一个可以切分的 `Span`。比如想要一个 4 页的 `Span`，如果只有 10 页的 `Span`，那么就切成 4 页和 6 页的两个 `Span`，将后者重新挂回合适的桶中。相关代码如下所示：
+
+```c++
+// 大于128页的直接向堆申请
+if (k > NPAGES - 1)
+{
+    void* ptr = SystemAlloc(k);
+    //Span* span = new Span;
+    Span* span = _spanPool.New();
+    span->_pageId = (PAGE_ID)ptr >> PAGE_SHIFT;
+    span->_n = k;
+    //_idSpanMap[span->_pageId] = span;
+    _idSpanMap.set(span->_pageId, span);
+
+    return span;
+}
+
+for (size_t i = k + 1; i < NPAGES; i++)
+{
+    if (!_spanLists[i].Empty())
+    {
+        // 切分成一个K页的 Span 和一个 n-k 页的 Span
+        // K页的返回给 central cache，n-k 页的挂到第 n-k 个桶中去
+        Span* nSpan = _spanLists[i].PopFront();
+        //Span* kSpan = new Span;
+        Span* kSpan = _spanPool.New();
+        // 在 nSpan 的头部切K页
+        kSpan->_pageId = nSpan->_pageId;
+        kSpan->_n = k;
+
+        nSpan->_pageId += k;
+        nSpan->_n -= k;
+
+        // 挂到第 n-k 个桶中去
+        _spanLists[nSpan->_n].PushFront(nSpan);
+        // 存储 nSpan 的首尾页号和 nSpan 映射，便于 page cache 回收内存时进行合并查找
+        //_idSpanMap[nSpan->_pageId] = nSpan;
+        //_idSpanMap[nSpan->_pageId + nSpan->_n - 1] = nSpan;
+        _idSpanMap.set(nSpan->_pageId, nSpan);
+        _idSpanMap.set(nSpan->_pageId + nSpan->_n - 1, nSpan);
+
+
+        // 建立 id 和 Span 的映射，方便 central cache 回收小块内存时查找对应的 Span
+        for (PAGE_ID i = 0; i < kSpan->_n; ++i)
+            _idSpanMap.set(kSpan->_pageId + i, kSpan);
+        //_idSpanMap[kSpan->_pageId + i] = kSpan;
+
+        return kSpan;
+    }
+```
+
+如果从第 k 号桶一直查到 128 号桶都没有合适的 span，就只能通过系统调用（如 `mmap` 或 `VirtualAlloc`）申请一个新的 128 页 `Span`，然后再按需切分。相关代码如下所示：
+
+```c++
+// 走到这里说明后面的桶都没有 Span
+// 找堆要一个128页的 Span
+//Span* bigSpan = new Span;
+Span* bigSpan = _spanPool.New();
+void* ptr = SystemAlloc(NPAGES - 1);
+bigSpan->_pageId = (PAGE_ID)ptr >> PAGE_SHIFT;
+bigSpan->_n = NPAGES - 1;
+
+_spanLists[bigSpan->_n].PushFront(bigSpan);
+
+return NewSpan(k);
+```
+
+**合并逻辑：**
+ 当 `CentralCache`  通过 `ReleaseSpanToPageCache()` 释放回一个 `Span` 后，`PageCache` 会尝试和相邻的空闲 `Span` 合并，减少碎片。比如一个页号为 100，管理 10 页的 `Span`，其范围是 [100, 110)。如果发现第 99 页和第 110 页对应的 `Span` 都是空闲的，就把它们合并为一个从 99 开始、总共 12 页的 `Span`。这个过程会向左右两边尽可能扩展，直到遇到不连续的页为止。相关代码如下所示：
+
+```c++
+// 对 Span 前后的页尝试进行合并，缓解内存碎片问题
+while (1)
+{
+    PAGE_ID prevId = span->_pageId - 1;
+    //auto ret = _idSpanMap.find(prevId);
+    //
+    //// 前面的页没有，不进行合并
+    //if (ret == _idSpanMap.end())
+    //	break;
+
+    auto ret = (Span*)_idSpanMap.get(prevId);
+    if (ret == nullptr)
+        break;
+
+
+    // 前面的页正在被使用，不进行合并
+    Span* prevSpan = ret;
+    if (prevSpan->_isUse == true)
+        break;
+    // 合并出超过128页的 Span，无法管理，不进行合并
+    if (prevSpan->_n + span->_n > NPAGES - 1)
+        break;
+
+    span->_pageId = prevSpan->_pageId;
+    span->_n += prevSpan->_n;
+
+    _spanLists[prevSpan->_n].Erase(prevSpan);
+    //delete prevSpan;
+    _spanPool.Delete(prevSpan);
+}
+
+// 向后合并
+while (1)
+{
+    PAGE_ID nextId = span->_pageId + span->_n;
+    //auto ret = _idSpanMap.find(nextId);
+    //// 后面的页没有，不进行合并
+    //if (ret == _idSpanMap.end())
+    //	break;
+    auto ret = (Span*)_idSpanMap.get(nextId);
+    if (ret == nullptr)
+        break;
+
+    // 后面的页正在被使用，不进行合并
+    Span* nextSpan = ret;
+    if (nextSpan->_isUse == true)
+        break;
+    // 合并出超过128页的 Span，无法管理，不进行合并
+    if (nextSpan->_n + span->_n > NPAGES - 1)
+        break;
+
+    span->_n += nextSpan->_n;
+
+    _spanLists[nextSpan->_n].Erase(nextSpan);
+    //delete nextSpan;
+    _spanPool.Delete(nextSpan);
+}
+```
+
+### 06.3 GetOneSpan 的获取逻辑
+
+前面我们知道，当 `CentralCache` 中没有可用的 `Span` 时，会调用 `GetOneSpan` 向 `PageCache` 请求。这个函数首先检查 `CentralCache` 对应的桶中是否有可用的 `Span`，如果没有就调用 `PageCache` 的 `NewSpan(size_t k)` 从 `PageCache` 取一个 k 页的 `Span`。
+
+这里的 k 需要根据实际请求的块大小 `size` 来计算，为此专门设计了一个“块大小到页数”的映射算法。例如申请 256KB 的块时，需要管理 64 页的 `Span`。具体计算过程我们已经在前面讲 `SizeClass::NumMovePage(size)` 的时候已经介绍过了，所以不再赘述。
+
+`CentralCache` 获取到 `Span` 后，会将它划分为若干个大小为 `size` 的块，然后通过指针串联成链表，挂在 `Span` 的 `_freeList` 上。这些块空间都是连续的，划分过程只需从起始地址出发，依次向后按 `size` 步进即可。
+
+划分完成后，将该 `Span` 插入 `CentralCache` 对应的桶中，然后返回给 `CentralCache` 使用。
+
+相关代码如下：
+
+```c++
+// 获取⼀个非空的 span
+Span* CentralCache::GetOneSpan(SpanList& list, size_t size)
+{
+    // 查看当前的 spanlist 是否还有未分配对象的 Span
+    Span* it = list.Begin();
+    while (it != list.End())
+    {
+        if (it->_freeList != nullptr)
+        {
+            return it;
+        }
+        else
+            it = it->_next;
+    }
+
+
+    // 走到这里说明没有空闲 Span 了，找 page cache 要
+    // 先把 central cache 的桶锁解开，防止其他线程释放对象时阻塞
+    list._mtx.unlock(); 
+
+    PageCache::GetInstance()->_pageMtx.lock();
+    Span* span = PageCache::GetInstance()->NewSpan(SizeClass::NumMovePage(size));
+    span->_isUse = true;
+    span->_objSize = size;
+    PageCache::GetInstance()->_pageMtx.unlock();
+
+    // 计算 Span 大块内存的起始地址和大小
+    // 以下操作不需要加锁，因为目前其他线程访问不到该Span
+    char* start = (char*)(span->_pageId << PAGE_SHIFT);
+    size_t bytes = span->_n << PAGE_SHIFT;
+    char* end = start + bytes;
+    // 把大块内存切成自由链表链接起来
+    span->_freeList = start;
+    start += size;
+    void* tail = span->_freeList;
+    int i = 1;
+    while (start < end)
+    {
+        ++i;
+        NextObj(tail) = start;
+        tail = NextObj(tail);
+        start += size;
+    }
+
+    NextObj(tail) = nullptr;
+
+    // 将切好的 Span 挂到桶里面时需要加锁
+    list._mtx.lock();
+    list.PushFront(span);
+
+    return span;
+}
+```
 
