@@ -27,7 +27,7 @@
 除了内存池，常见的池化技术还包括：
 
 1. **连接池**：例如数据库连接池。每次与数据库建立连接都是一个耗时的操作，如果每次仅执行一个简单的SQL语句后就关闭连接，会浪费大量时间。因此，连接池通常会预先创建多个连接，执行SQL时从池中获取一个空闲连接，执行完后不关闭连接，继续等待下一次使用。这样可以避免频繁的连接和断开操作。
-2. **线程池**：线程池的思想是预先创建一定数量的线程，并使它们处于休眠状态。当有客户端请求时，唤醒一个空闲线程来处理该请求。处理完毕后，线程进入休眠状态，等待下一个请求。在我的前一篇博客中，我也演示了如何实现一个简单的线程池，感兴趣的朋友可以参考。
+2. **线程池**：线程池的思想是预先创建一定数量的线程，并使它们处于休眠状态。当有客户端请求时，唤醒一个空闲线程来处理该请求。处理完毕后，线程进入休眠状态，等待下一个请求。
 
 池化技术的核心思想在于提前申请并重复使用资源，从而减少重复创建资源的开销，提升效率。不同类型的池在实现细节上可能有所不同，但其根本思想是相似的。
 
@@ -881,3 +881,321 @@ Span* CentralCache::GetOneSpan(SpanList& list, size_t size)
 }
 ```
 
+## 07 回收空间
+
+在内存分配的过程中，不仅要高效地申请空间，合理地回收也同样关键。我们先来看看 `ThreadCache` 是如何回收空间的。
+
+### 07.1 Thread Cache 的归还逻辑
+
+当线程释放内存时，它会先将这些块对齐后挂回到对应大小的自由链表中。但如果某个链表里的块数量过多，就需要将部分块归还给 `CentralCache`。具体的判断标准是：某个桶中的块数如果超过当前的最大申请批量（即 `MaxSize`），就会把 `MaxSize` 个块还给 `CentralCache`。相关代码如下所示：
+
+```c++
+void ThreadCache::Deallocate(void* ptr, size_t size)
+{
+    assert(size <= MAX_BYTES);
+    assert(ptr);
+
+    size_t index = SizeClass::Index(size);
+    _freeLists[index].Push(ptr);
+
+    if (_freeLists[index].Size() >= _freeLists[index].MaxSize())
+    {
+        ListTooLong(_freeLists[index], size);
+    }
+}
+
+void ThreadCache::ListTooLong(FreeList& list, size_t size)
+{
+	void* start = nullptr;
+	void* end = nullptr;
+	list.PopRange(start, end, list.MaxSize());
+
+	CentralCache::GetInstance()->ReleaseListToSpans(start, size);
+}
+```
+
+值得一提的是，这个 `MaxSize` 是动态变化的，从 1 开始递增，呈等差数列增长。随着线程不断请求同样大小的块，这个数列的总申请量自然会超过某次的 `MaxSize`。因此，当这些块被释放回来时，很可能一次就超过当前允许的最大数量，触发归还机制。
+
+实际的 `tcmalloc` 源码比这里展示的逻辑要复杂得多，除了块数，还会考虑如线程总管理空间不能超过 2MB 等其他因素。我们这里只是用一个简化版规则来理解这个过程。
+
+### 07.2 Central Cache 的归还逻辑
+
+当 `CentralCache` 收到 `ThreadCache` 归还的一段空间时，它并不能简单地认为这些块来自同一个 `Span`。因为这些空间可能是多个 `Span` 的组合，归还时间也不同。
+
+好在每块内存都有地址，我们可以通过 `地址 >> 13`（即除以 8KB）来获取页号，然后通过预先建立的哈希表（页号 -> `Span` 映射）快速定位块所属的 `Span`。这比逐个对比所有 `Span` 要高效得多，时间复杂度从 O(m*n) 降到 O(1)。
+
+这张哈希表在分配 `Span` 给 `CentralCache` 时就会更新，并保存在 `PageCache` 中。这样后续 `CentralCache` 回收空间时，只需地址右移再查表，即可知道该块属于哪个 span。
+
+`CentralCache` 在处理这些块时，会逐一将它们插入对应 `Span` 的 `_freeList`，并更新其 `_useCount`。一旦 `_useCount` 归零，说明该 `Span` 的所有块都已归还，这时可以考虑将它交还给 `PageCache`，以便将其合并为更大的 `Span`。
+
+在归还前，需要先把该 `Span` 从 `CentralCache` 的桶中移除，并将其 `_freeList` 设为空。因为经过多次归还，这些块的顺序已经被打乱，已无法再作为一个有序链表使用，但这不影响 `PageCache` 之后的统一管理。
+
+由于 `Span` 的合并涉及修改共享结构，为避免并发冲突，这一过程要加锁。同样，在归还 `Span` 之前也需要释放当前桶的锁，以免阻塞其他线程的操作。
+
+相关代码如下：
+
+```c++
+void CentralCache::ReleaseListToSpans(void* start, size_t size)
+{
+    size_t index = SizeClass::Index(size);
+
+    _spanLists[index]._mtx.lock();
+
+    while (start)
+    {
+        void* next = NextObj(start);
+        Span* span = PageCache::GetInstance()->MapObjectToSpan(start);
+        NextObj(start) = span->_freeList;
+        span->_freeList = start;
+
+        span->_useCount--;
+
+        if (span->_useCount == 0)
+        {
+            // 说明 Span 切分出去的所有小块内存都已归还
+            // 此时该 Span 可以再向 page cache 归还并尝试相邻页的合并
+            _spanLists[index].Erase(span);
+            span->_freeList = nullptr;
+            span->_next = nullptr;
+            span->_prev = nullptr;
+            // 释放 Span 给 page cache 时，使用 page cache 的锁即可
+            // 暂时把桶锁解掉
+            _spanLists[index]._mtx.unlock();
+
+            PageCache::GetInstance()->_pageMtx.lock();
+            PageCache::GetInstance()->ReleaseSpanToPageCache(span);
+            PageCache::GetInstance()->_pageMtx.unlock();
+
+            _spanLists[index]._mtx.lock();
+        }
+
+        start = next;
+    }
+
+    _spanLists[index]._mtx.unlock();
+}	
+```
+
+### 07.3 Page Cache 的归还逻辑
+
+当 `PageCache` 接收到 `CentralCache` 归还的 `Span`，它不会立刻挂到固定大小的桶中。因为有可能存在前后页相邻的其他空闲 `Span`，这时我们就可以将它们合并，形成更大的内存块，提高空间利用率。合并逻辑和前面的分裂类似，也需要加锁来保证安全。
+
+具体的合并过程我们已经在**Span 的分裂与合并机制**小节那里讲过了，所以这里就不再赘述，相关代码如下：
+
+```c++
+void PageCache::ReleaseSpanToPageCache(Span* span)
+{
+    // 大于128页的直接还给堆
+    if (span->_n > NPAGES - 1)
+    {
+        void* ptr = (void*)(span->_pageId << PAGE_SHIFT);
+        SystemFree(ptr);
+        //delete span;
+        _spanPool.Delete(span);
+
+        return;
+    }
+
+    // 对 Span 前后的页尝试进行合并，缓解内存碎片问题
+    while (1)
+    {
+        PAGE_ID prevId = span->_pageId - 1;
+        //auto ret = _idSpanMap.find(prevId);
+        //
+        //// 前面的页没有，不进行合并
+        //if (ret == _idSpanMap.end())
+        //	break;
+
+        auto ret = (Span*)_idSpanMap.get(prevId);
+        if (ret == nullptr)
+            break;
+
+
+        // 前面的页正在被使用，不进行合并
+        Span* prevSpan = ret;
+        if (prevSpan->_isUse == true)
+            break;
+        // 合并出超过128页的 Span，无法管理，不进行合并
+        if (prevSpan->_n + span->_n > NPAGES - 1)
+            break;
+
+        span->_pageId = prevSpan->_pageId;
+        span->_n += prevSpan->_n;
+
+        _spanLists[prevSpan->_n].Erase(prevSpan);
+        //delete prevSpan;
+        _spanPool.Delete(prevSpan);
+    }
+
+    // 向后合并
+    while (1)
+    {
+        PAGE_ID nextId = span->_pageId + span->_n;
+        //auto ret = _idSpanMap.find(nextId);
+        //// 后面的页没有，不进行合并
+        //if (ret == _idSpanMap.end())
+        //	break;
+        auto ret = (Span*)_idSpanMap.get(nextId);
+        if (ret == nullptr)
+            break;
+
+        // 后面的页正在被使用，不进行合并
+        Span* nextSpan = ret;
+        if (nextSpan->_isUse == true)
+            break;
+        // 合并出超过128页的 Span，无法管理，不进行合并
+        if (nextSpan->_n + span->_n > NPAGES - 1)
+            break;
+
+        span->_n += nextSpan->_n;
+
+        _spanLists[nextSpan->_n].Erase(nextSpan);
+        //delete nextSpan;
+        _spanPool.Delete(nextSpan);
+    }
+
+    _spanLists[span->_n].PushFront(span);
+    span->_isUse = false;
+    //_idSpanMap[span->_pageId] = span;
+    //_idSpanMap[span->_pageId + span->_n - 1] = span;
+    _idSpanMap.set(span->_pageId, span);
+    _idSpanMap.set(span->_pageId + span->_n - 1, span);
+
+}
+```
+
+## 08 细节处理
+
+到这里，整个内存分配与释放的主流程已经基本完成了，接下来要处理的是一些细节问题。虽然这些部分不像主流程那样硬核，但要想系统真正稳定高效运行，把这些小问题理清楚同样重要。
+
+首先是单次申请超过 256KB 的情况。我们在之前的逻辑中默认 `ThreadCache` 不会处理超过 256KB 的请求，但在实际使用中这种需求是存在的。我们知道 `PageCache` 中一个 `Span` 最多可以管理 128 页的空间，即 1MB（128 × 8KB）。因此，如果申请的空间在 256KB 到 1MB 之间，就不再从 `ThreadCache`  请求，直接向 `PageCache` 申请即可。
+
+另外，大于 256KB 的空间在申请时需要按页对齐。举个例子：申请 257KB，虽然只超出一点，但由于已经超过 256KB，因此要按页对齐，257KB 对应 32.125 页，就得向上取整，按 33 页来分配，总共是 264KB。这种对齐可能带来几 KB 的碎片，但因为使用周期短、很快就会释放，所以影响不大。
+
+相关代码如下所示：
+
+```c++
+static inline size_t RoundUp(size_t size)
+{
+    if (size <= 128)
+        return _RoundUp(size, 8);
+    else if (size <= 1024)
+        return _RoundUp(size, 16);
+    else if (size <= 8 * 1024)
+        return _RoundUp(size, 128);
+    else if (size <= 64 * 1024)
+        return _RoundUp(size, 1024);
+    else if (size <= 256 * 1024)
+        return _RoundUp(size, 8 * 1024);
+    else
+        return _RoundUp(size, 1 << PAGE_SHIFT);
+    // 单次申请空间大于256KB，直接按照页来对齐
+}
+```
+
+对应地，释放过程也遵循类似原则：不再经过 `ThreadCache`，而是直接交由 `PageCache` 处理。如果申请的空间超过了 128 页，那就是直接向操作系统释放。
+
+为了支持这些逻辑，代码中在 `ConcurrentAlloc` 和 `NewSpan` 中加入了对大页数的处理，同时在 `ReleaseSpanToPageCache` 中新增了向操作系统释放空间的逻辑。你可以通过一些测试用例验证，比如申请 257KB（即 33 页）和 129 页的空间，前者会走已有逻辑，后者会直接触发新的逻辑，检查是否按预期走通即可。
+
+相关代码如下所示：
+
+```c++
+// 大于128页的直接向堆申请
+if (k > NPAGES - 1)
+{
+    void* ptr = SystemAlloc(k);
+    //Span* span = new Span;
+    Span* span = _spanPool.New();
+    span->_pageId = (PAGE_ID)ptr >> PAGE_SHIFT;
+    span->_n = k;
+    //_idSpanMap[span->_pageId] = span;
+    _idSpanMap.set(span->_pageId, span);
+
+    return span;
+}
+
+// 直接去堆上按页申请空间
+inline static void *SystemAlloc(size_t kpage)
+{
+#ifdef _WIN32
+	void *ptr = VirtualAlloc(0, kpage << 13, MEM_COMMIT | MEM_RESERVE,
+							 PAGE_READWRITE);
+#else
+	// Linux下brk mmap等
+#endif
+	if (ptr == nullptr)
+		throw std::bad_alloc();
+	return ptr;
+}
+
+// ReleaseSpanToPageCache 部分代码
+// 大于128页的直接还给堆
+if (span->_n > NPAGES - 1)
+{
+    void* ptr = (void*)(span->_pageId << PAGE_SHIFT);
+    SystemFree(ptr);
+    //delete span;
+    _spanPool.Delete(span);
+
+    return;
+}
+
+// SystemFree 实现
+inline static void SystemFree(void *ptr)
+{
+#ifdef _WIN32
+	VirtualFree(ptr, 0, MEM_RELEASE);
+#else
+	// sbrk unmmap等
+#endif
+}
+```
+
+项目完成后，为了更贴近实际使用，我们进一步优化了一点：让它尽量不依赖 `malloc`。虽然这个简易内存池还不够强大，不能完全取代 `malloc`，但如果要求没那么高，它已经是个不错的替代方案。要做到不使用 `malloc`，就得把项目中用到 `new` 的地方改成使用我们自定义的定长内存池，比如线程级的 `TLSThreadCache` 和 `PageCache` 中大量使用的 `Span`。
+
+```c++
+T* New()
+{
+    T* obj = nullptr;
+    // 优先使用还回来的内存
+    if (_freeList)
+    {
+        void* next = *((void**)_freeList);
+        obj = (T*)_freeList;
+        _freeList = next;
+
+    }
+    else
+    {
+        // 如果剩余内存不够一个对象大小时，则重新开大块空间
+        if (_remainBytes < sizeof(T))
+        {
+            _remainBytes = 128 * 1024;
+            //_memory = (char*)malloc(_remainBytes);
+            _memory = (char*)SystemAlloc(_remainBytes >> 13);
+            if (_memory == nullptr)
+                throw std::bad_alloc();
+        }
+
+        obj = (T*)_memory;
+        size_t objSize = sizeof(T) < sizeof(void*) ? sizeof(void*) : sizeof(T);
+        _memory += objSize;
+        _remainBytes -= objSize;
+
+    }
+
+    // 定位new，显示调用T的构造函数初始化
+    new(obj)T;
+    return obj;
+}
+```
+
+这时候要注意一个线程安全问题：我们的定长内存池是静态的，在多线程环境下，多个线程共享这个池子，如果不加锁就可能在并发申请空间时出现空指针引用，造成程序崩溃。尤其是在第一次分配内存的时候，如果两个线程同时触发，那就很可能出现竞态。因此需要在分配过程中加一把互斥锁，保证线程安全。不过，为了性能考虑，我们只在创建 `TLSThreadCache` 的时候加锁，因为这个过程每个线程只会执行一次，而 `Span` 的创建在已有的 `PageCache` 锁保护下，是线程安全的。
+
+另外还有一个小优化点：我们希望在释放对象时不需要额外传入大小信息。实现这个只需要在 `Span` 中记录下每个 `Span` 被切分时的块大小，比如加一个 `_objSize` 字段。当释放时，我们可以通过指针找到对应的页号，再查表找到对应的 `Span`，通过 `_objSize` 就知道应该释放多大的块了。
+
+不过，涉及查表的过程也得注意线程安全。因为我们用的是 `unordered_map` 来映射页号和 `Span`，而这个容器不是线程安全的。如果在增删元素时刚好有其他线程在查，就可能读取到无效数据，甚至崩溃。因此在 `MapObjToSpan` 中也需要加锁，这把锁直接复用 `PageCache` 的全局锁就可以了。
+
+
+
+到这里，这些“细枝末节”的内容也算处理得差不多了。它们虽然不是主流程，但却让整个系统更加健壮和完整。剩下的就交给你的调试了，看看这些边角功能是否按预期运行，一步步打磨，系统就会越来越稳。
