@@ -41,11 +41,11 @@
 
 **● Central Cache**
 
-线程缓存不够时，从 Central Cache 请求空间。
+线程缓存不够时，从 `Central Cache` 请求空间。
 
 **● Page Cache**
 
-当 Central Cache 空间不足或释放空间过多时，向 Page Cache 请求或归还内存。Page Cache 以页为单位组织内存，负责整合碎片，进行 Span 的合并与拆分。
+当 `Central Cache` 空间不足或释放空间过多时，向 `Page Cache` 请求或归还内存。`Page Cache` 以页为单位组织内存，负责整合碎片，进行 `Span` 的合并与拆分。
 
 ## 03 定长内存池：快速入门
 
@@ -1068,6 +1068,8 @@ void PageCache::ReleaseSpanToPageCache(Span* span)
 
 到这里，整个内存分配与释放的主流程已经基本完成了，接下来要处理的是一些细节问题。虽然这些部分不像主流程那样硬核，但要想系统真正稳定高效运行，把这些小问题理清楚同样重要。
 
+### 08.1 单次申请超过256KB时的处理
+
 首先是单次申请超过 256KB 的情况。我们在之前的逻辑中默认 `ThreadCache` 不会处理超过 256KB 的请求，但在实际使用中这种需求是存在的。我们知道 `PageCache` 中一个 `Span` 最多可以管理 128 页的空间，即 1MB（128 × 8KB）。因此，如果申请的空间在 256KB 到 1MB 之间，就不再从 `ThreadCache`  请求，直接向 `PageCache` 申请即可。
 
 另外，大于 256KB 的空间在申请时需要按页对齐。举个例子：申请 257KB，虽然只超出一点，但由于已经超过 256KB，因此要按页对齐，257KB 对应 32.125 页，就得向上取整，按 33 页来分配，总共是 264KB。这种对齐可能带来几 KB 的碎片，但因为使用周期短、很快就会释放，所以影响不大。
@@ -1151,6 +1153,8 @@ inline static void SystemFree(void *ptr)
 }
 ```
 
+### 08.2 使用定长内存池替代 new 和 malloc
+
 项目完成后，为了更贴近实际使用，我们进一步优化了一点：让它尽量不依赖 `malloc`。虽然这个简易内存池还不够强大，不能完全取代 `malloc`，但如果要求没那么高，它已经是个不错的替代方案。要做到不使用 `malloc`，就得把项目中用到 `new` 的地方改成使用我们自定义的定长内存池，比如线程级的 `TLSThreadCache` 和 `PageCache` 中大量使用的 `Span`。
 
 ```c++
@@ -1190,12 +1194,262 @@ T* New()
 }
 ```
 
+### 08.3 多线程下的内存池安全问题
+
 这时候要注意一个线程安全问题：我们的定长内存池是静态的，在多线程环境下，多个线程共享这个池子，如果不加锁就可能在并发申请空间时出现空指针引用，造成程序崩溃。尤其是在第一次分配内存的时候，如果两个线程同时触发，那就很可能出现竞态。因此需要在分配过程中加一把互斥锁，保证线程安全。不过，为了性能考虑，我们只在创建 `TLSThreadCache` 的时候加锁，因为这个过程每个线程只会执行一次，而 `Span` 的创建在已有的 `PageCache` 锁保护下，是线程安全的。
 
-另外还有一个小优化点：我们希望在释放对象时不需要额外传入大小信息。实现这个只需要在 `Span` 中记录下每个 `Span` 被切分时的块大小，比如加一个 `_objSize` 字段。当释放时，我们可以通过指针找到对应的页号，再查表找到对应的 `Span`，通过 `_objSize` 就知道应该释放多大的块了。
+```c++
+// 通过 TLS，每个进程可无锁获取自己的ThreadCache对象
+if (pTLSThreadCache == nullptr)
+{
+    static ObjectPool<ThreadCache> tcPool;
+    //pTLSThreadCache = new ThreadCache;
 
-不过，涉及查表的过程也得注意线程安全。因为我们用的是 `unordered_map` 来映射页号和 `Span`，而这个容器不是线程安全的。如果在增删元素时刚好有其他线程在查，就可能读取到无效数据，甚至崩溃。因此在 `MapObjToSpan` 中也需要加锁，这把锁直接复用 `PageCache` 的全局锁就可以了。
+    // 防止 Thread Cache 申请到空指针
+    tcPool._poolMtx.lock();
+    pTLSThreadCache = tcPool.New();
+    tcPool._poolMtx.unlock();
+
+}
+```
+
+### 08.4 MapObjToSpan 的加锁处理
+
+涉及查表的过程也得注意线程安全。因为我们用的是 `unordered_map` 来映射页号和 `Span`，而这个容器不是线程安全的。如果在增删元素时刚好有其他线程在查，就可能读取到无效数据，甚至崩溃。因此在 `MapObjectToSpan` 中也需要加锁，这把锁直接复用 `PageCache` 的全局锁就可以了。
+
+```c++
+Span* PageCache::MapObjectToSpan(void* obj)
+{
+    PAGE_ID id = (PAGE_ID)obj >> PAGE_SHIFT;
+
+    std::unique_lock<std::mutex> lock(_pageMtx);	// 出了作用域自动解锁
+
+    auto ret = (Span*)_idSpanMap.get(id);
+    assert(ret != nullptr);
+    return ret;
+
+}
+```
+
+## 09 使用基数树进行优化
+
+### 09.1 初步结果对比
+
+到这里，核心功能已经完成了，是时候看看我们写的 `ConcurrentAlloc` 和系统自带的 `malloc` 在性能上谁更胜一筹。我们专门写了一个 `BenchMark.cpp` 来进行对比测试：
+
+```c++
+#include "ConcurrentAlloc.h"
+
+// ntimes 一轮申请和释放内存的次数
+// rounds 轮次
+void BenchmarkMalloc(size_t ntimes, size_t nworks, size_t rounds)
+{
+	std::vector<std::thread>vthread(nworks);
+	std::atomic<size_t> malloc_costtime = 0;
+	std::atomic<size_t> free_costtime = 0;
+	for (size_t k = 0; k < nworks; ++k)
+	{
+		vthread[k] = std::thread([&, k]{
+		std::vector<void*> v;
+		v.reserve(ntimes);
+		for (size_t j = 0; j < rounds; ++j)
+		{
+		size_t begin1 = clock();
+		for (size_t i = 0; i < ntimes; i++)
+		{
+		//v.push_back(malloc(16));
+		v.push_back(malloc((16 + i) % 8192 + 1));
+		}
+		size_t end1 = clock();
+		size_t begin2 = clock();
+		for (size_t i = 0; i < ntimes; i++)
+		{
+			free(v[i]);
+		}
+		size_t end2 = clock();
+		v.clear();
+		malloc_costtime += (end1 - begin1);
+		free_costtime += (end2 - begin2);
+		}
+			});
+	}
+	for (auto& t : vthread)
+	{
+		t.join();
+	}
+	printf("%u个线程并发执行%u轮次，每轮次malloc %u次: 花费：%u ms\n",
+		nworks, rounds, ntimes, malloc_costtime.load());
+
+	printf("%u个线程并发执行%u轮次，每轮次free %u次: 花费：%u ms\n",
+		nworks, rounds, ntimes, free_costtime.load());
+
+	printf("%u个线程并发malloc&free %u次，总计花费：%u ms\n",
+		nworks, nworks * rounds * ntimes, malloc_costtime.load() + free_costtime.load());
+}
 
 
+// 单轮次申请释放次数 线程数 轮次
+void BenchmarkConcurrentMalloc(size_t ntimes, size_t nworks, size_t rounds)
+{
 
-到这里，这些“细枝末节”的内容也算处理得差不多了。它们虽然不是主流程，但却让整个系统更加健壮和完整。剩下的就交给你的调试了，看看这些边角功能是否按预期运行，一步步打磨，系统就会越来越稳。
+	std::vector<std::thread>vthread(nworks);
+	std::atomic<size_t> malloc_costtime = 0;
+	std::atomic<size_t> free_costtime = 0;
+	for (size_t k = 0; k < nworks; ++k)
+	{
+		vthread[k] = std::thread([&]() {
+		std::vector<void*> v;
+		v.reserve(ntimes);
+		for (size_t j = 0; j < rounds; ++j)
+		{
+			size_t begin1 = clock();
+			for (size_t i = 0; i < ntimes; i++)
+			{
+				//v.push_back(ConcurrentAlloc(16));
+				v.push_back(ConcurrentAlloc((16 + i) % 8192 + 1));
+			}
+			size_t end1 = clock();
+			size_t begin2 = clock();
+			for (size_t i = 0; i < ntimes; i++)
+			{
+				ConcurrentFree(v[i]);
+			}
+			size_t end2 = clock();
+			v.clear();
+			malloc_costtime += (end1 - begin1);
+			free_costtime += (end2 - begin2);
+		}
+			});
+	}
+	for (auto& t : vthread)
+	{
+		t.join();
+	}
+
+	printf("%u个线程并发执行%u轮次，每轮次concurrent alloc %u次: 花费：%u ms\n",
+		nworks, rounds, ntimes, malloc_costtime.load());
+
+	printf("%u个线程并发执行%u轮次，每轮次concurrent dealloc %u次: 花费：%u ms\n",
+		nworks, rounds, ntimes, free_costtime.load());
+
+	printf("%u个线程并发concurrent alloc&dealloc %u次，总计花费：%u ms\n",
+		nworks, nworks * rounds * ntimes, malloc_costtime.load() + free_costtime.load());
+}
+
+int main()
+{
+	size_t n = 10000;
+	cout << "==========================================================" << endl;
+	BenchmarkConcurrentMalloc(n, 4, 10);
+	cout << endl << endl;
+	BenchmarkMalloc(n, 4, 10);
+	cout << "==========================================================" << endl;
+	return 0;
+}
+```
+
+这个测试会启动多个线程，让每个线程进行多轮次的内存申请和释放操作。测试包括两种场景：一种是每次申请固定大小的内存块，另一种是每次申请不同大小的内存块，模拟真实环境下更复杂的内存使用模式。
+
+我们分别用 `malloc/free` 和 `ConcurrentAlloc/ConcurrentFree` 执行相同任务，并记录它们的耗时，最后将结果打印出来。
+
+运行结果：
+
+![](https://raw.githubusercontent.com/Kutbas/GraphBed/main/Typora/202504131648202.png)
+
+可以看到，虽然性能相比 `malloc` 有所提升，但还有没有进一步优化的空间呢？下面我们用性能分析工具来观察一下。
+
+### 09.2 使用性能探查器分析性能瓶颈
+
+不同平台都有自己的性能分析工具，我这里用的是 `Visual Studio` 自带的性能探查器。
+
+打开性能分析工具后，勾选需要检测的项目，点击开始，它会自动收集函数调用频率和耗时信息。分析完成后，我们能看到一些关键指标，比如哪个函数最耗时。
+
+在“热路径”里，可以看到函数的调用链，比如 `std::thread::invoke` 调用了 `std::invoke`，后者又进一步调用 `lambda` 转换成的仿函数。这就像栈帧一样，直观地告诉你时间都花在哪儿了。
+
+还有一个“单个工作最耗时函数”的视图，显示了某个函数总共执行了多久。比如我们这里就发现，最耗时的是 `lock`，看来加锁的开销相当大。
+
+![](https://raw.githubusercontent.com/Kutbas/GraphBed/main/Typora/202504131653092.png)
+
+能不能避免频繁加锁带来的开销？当然可以。比如 `tcmalloc` 就用了一种叫“**基数树**”的结构来处理这类问题，有效规避了频繁加锁对性能的影响。
+
+### 09.3 引入基数树
+
+为了优化前面提到的性能瓶颈，`tcmalloc` 使用了基数树结构来代替传统的 `unordered_map`。原因在于，当数据量增大时，哈希查找和锁竞争的成本急剧上升，查得越慢，锁竞争越激烈，最终导致整体性能下滑。
+
+**基数树（Radix Tree）**在 `tcmalloc` 中被设计为一到三层的结构，按需选择。其中一层的基数树最简单，本质上就是一个数组，通过页号直接作为下标定位到对应的 `Span*` 指针。这种结构在页号不多、位数不高的情况下，可以直接开出一个 2M 大小的数组，不仅查找速度快，而且不需要加锁。
+
+```c++
+class TCMalloc_PageMap1
+{
+    private:
+    static const int LENGTH = 1 << BITS;
+    void** array_;
+
+    public:
+    typedef uintptr_t Number;
+
+    explicit TCMalloc_PageMap1()
+    {
+        //*array_ = reinterpret_cast<void**>((*allocator)(sizeof(void*) << BITS));
+        size_t size = sizeof(void*) << BITS;
+        size_t alignSize = SizeClass::_RoundUp(size, 1 << PAGE_SHIFT);
+        array_ = (void**)SystemAlloc(alignSize >> PAGE_SHIFT);
+        memset(array_, 0, sizeof(void*) << BITS);
+    }
+    // Return the current value for KEY. Returns NULL if not yet set,
+    // or if k is out of range.
+    void* get(Number k) const
+    {
+        if ((k >> BITS) > 0)
+        {
+            return nullptr;
+        }
+        return array_[k];
+    }
+    // REQUIRES "k" is in range "[0,2^BITS-1]".
+    // REQUIRES "k" has been ensured before.
+    //
+    // Sets the value 'v' for key 'k'.
+    void set(Number k, void* v)
+    {
+        array_[k] = v;
+    }
+};
+```
+
+如果页号位数更多，比如页号占了 19 位，那么这个数组长度就是 2^19^，对应约2MB空间，这在 32 位平台上是完全可接受的。但到了64 位系统，页号的位数可能达到 51 位，直接映射将消耗 2^54^ 字节（约 16PB）内存，显然是不现实的，因此就需要分层。
+
+两层基数树的结构类似于二级页表：用页号的前几位（比如5位）索引第一层数组，每个元素指向一个新的数组，再由页号的后几位（比如14位）索引第二层数组中对应的 `Span*`。这样不仅实现了快速定位，也允许延迟分配内存，仅在实际映射某段页号时才创建对应的子数组，节省了空间。
+
+三层结构则更进一步，适配 64 位系统的巨大地址空间。其原理和前面一样，只是多了一层索引，让整棵树可以稀疏展开，不需要在初始化时一次性开辟天文数字级别的内存，而是按需动态申请。
+
+使用基数树的另一个优势是它的结构是静态的，即不会频繁调整或改变。读操作仅是通过数组下标获取指针，写操作只是设置某个数组元素指向新的 `Span*`。这意味着，在大多数情况下，读取过程中不会发生结构变动，也就不会有线程安全问题。因此，我们可以在读取时放心地去掉锁，从而进一步提升性能。
+
+实际优化中，我们将原本 `PageCache` 中使用的 `unordered_map` 替换为单层基数树，在所有需要设置 `Span*` 的地方使用 `set()`，读取的地方使用 `get()`，并根据返回值是否为 `nullptr` 来判断是否成功获取。原先用于处理迭代器和比较的逻辑，也相应地简化了。
+
+```c++
+//_idSpanMap[span->_pageId] = span;
+//_idSpanMap[span->_pageId + span->_n - 1] = span;
+_idSpanMap.set(span->_pageId, span);
+_idSpanMap.set(span->_pageId + span->_n - 1, span);
+```
+
+最后，由于整个基数树的写入和读取逻辑在流程中是严格分离的，我们可以保证不会出现两个线程同时对同一个页号进行读写操作的情况，这就为彻底移除锁提供了基础条件，使得整体性能在数据量增长时也能保持良好表现。
+
+### 09.4 优化后的性能对比
+
+使用基数树进行优化后，下面我们再用性能探查工具观察一下优化后的结果：
+
+![](https://raw.githubusercontent.com/Kutbas/GraphBed/main/Typora/202504131711445.png)
+
+可以看到，此时最耗时的操作不再是 `lock`，而 `malloc` 和 `free` 作为我们被优化的对象理应排在了前列。
+
+我们再看看 `BenchMark.cpp` 的运行结果：
+
+![](https://raw.githubusercontent.com/Kutbas/GraphBed/main/Typora/202504131714389.png)
+
+可以看出，这次 `ConcurrentAlloc/ConcurrentFree` 的运行速度相比 `malloc/free` 快了不少。
+
+到这里，这个小项目就算告一段落了。最后再强调一遍：本项目的目的并不是完全复刻 `tcmalloc` 的源码，而是学习大佬的思路，深入理解其核心机制，从而提升自己的能力。
+
+毕竟真正的 `tcmalloc` 源码多达几万行，我这边最终也就写了不到两千行代码，只是挑选其中的关键逻辑做了实现与讲解。如果你对源码感兴趣，推荐直接去 GitHub 上阅读原版，收获肯定会更大。
